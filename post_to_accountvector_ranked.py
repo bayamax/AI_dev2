@@ -3,14 +3,14 @@
 """
 post_to_accountvector_ranked.py
 ────────────────────────────────────────────────────────
-Hard Negative 80 % ＋ Easy Negative 20 % で BPR ランキング学習
+Hard Negative 80 % + Easy Negative 20 % で BPR ランキング学習
 ・投稿が 1 件も無いユーザーは正例・負例とも完全除外
-・list/tuple 混在バグを根本解消
-・tensor 警告を解消（np.stack → tensor）
+・list/tuple 混在バグ解消
+・tensor 警告解消（np.stack → tensor）
 """
 
 from pathlib import Path
-import csv, random, traceback, time                       # ← time を追加
+import csv, random, traceback, time
 from collections import defaultdict
 
 import numpy as np
@@ -131,7 +131,9 @@ def pad_posts(lst):
 
 def compute_acc_vecs(posts, dev, ap):
     users = list(posts.keys())
-    V = np.stack([posts[u][0] * 0 for u in users])  # プレースホルダ
+    # 正しい形 (U, ACCOUNT_DIM) で初期化
+    V = np.zeros((len(users), ACCOUNT_DIM), dtype=np.float32)
+
     ap.eval()
     with torch.no_grad():
         for i in range(0, len(users), 512):
