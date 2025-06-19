@@ -4,8 +4,10 @@
 post_to_accountvector_ranked_fast_val.py
 ────────────────────────────────────────────────────────
 ● 投稿 Tensor を **CPU + fp16** でキャッシュ → VRAM/ピン問題解消
-● DataLoader の worker=0 で FD リーク根絶                      ★ NEW
-● fp16→fp32 キャストで dtype ミスマッチを解消                  ★ 先行修正
+● DataLoader は worker=0 で FD リーク根絶
+● fp16→fp32 キャストで dtype ミスマッチ解消
+● AttentionPool を compute_acc_vecs 後に GPU に戻して
+  “CUDA vs CPU” デバイス衝突を回避                         ★ NEW
 ● Hard Neg 80 % + Easy Neg 20 %、HardNeg は 2 epoch ごと再計算
 ● train loss と valAUC を同時に記録し、最良モデルを自動保存
 ● rank_follow_model.pt があればロードして続きから再開
@@ -49,8 +51,8 @@ HARD_TOPN     = 20
 EASY_NEG_RATE = 0.2
 VALID_RATIO   = 0.15
 HN_INTERVAL   = 2
-NUM_WORKERS   = 0                          # ★ もう FD を開かない
-FP16          = True                       # ★ CPU キャッシュを fp16
+NUM_WORKERS   = 0                          # worker を使わず FD 完全封殺
+FP16          = True                       # CPU 側キャッシュは fp16
 # ────────────────────────────────────────────────
 
 def log(msg: str):
@@ -87,7 +89,7 @@ class AttentionPool(nn.Module):
         self.sc   = nn.Linear(POST_DIM, 1, bias=False)
 
     def forward(self, x, m):
-        x = x.float()                       # fp16 → fp32
+        x = x.float()                       # fp16 → fp32 キャスト
         x = F.normalize(x, p=2, dim=-1)
         x = self.ln(x + self.mha(x, x, x, key_padding_mask=(m == 0))[0])
         w = F.softmax(self.sc(x).squeeze(-1).masked_fill(m == 0, -1e9), -1)
@@ -135,6 +137,9 @@ def build_post_cache(posts):
     return cache
 
 def compute_acc_vecs(cache, device, ap):
+    """
+    ap (AttentionPool) を GPU で推論 → 計算後 **戻さず** (呼び出し側で戻す)
+    """
     users = list(cache.keys())
     V = torch.zeros((len(users), ACCOUNT_DIM), dtype=torch.float32, device=device)
     ap.to(device).eval()
@@ -144,7 +149,6 @@ def compute_acc_vecs(cache, device, ap):
             fp = torch.stack(fp).to(device, non_blocking=True).float()
             fm = torch.stack(fm).to(device, non_blocking=True).float()
             V[i:i + len(fp)] = ap(fp, fm)
-    ap.to('cpu')
     return users, V
 
 def hard_negs(users, V, pos_edges):
@@ -231,6 +235,9 @@ def train():
         if ep == 1 or ep % HN_INTERVAL == 0:
             users, V = compute_acc_vecs(post_cache, dev, model.ap)
             hard = hard_negs(users, V, train_e)
+            model.ap.to(dev)              # ★ GPU に戻す ← 重要
+            torch.cuda.empty_cache()
+
         easy = easy_negs(list(valid_users), train_e)
 
         ds = TripletDS(train_e, hard + easy, post_cache)
