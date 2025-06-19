@@ -4,8 +4,9 @@
 post_to_accountvector_ranked_fast_val.py
 ────────────────────────────────────────────────────────
 ● 投稿 Tensor を **CPU + fp16** でキャッシュ → VRAM/ピン問題解消
-● DataLoader は spawn + pin_memory=True（non-blocking copy）
-● dtype ミスマッチを解消（fp16→fp32 キャスト）          ★ NEW
+● DataLoader は spawn + pin_memory=True
+   ↳ persistent_workers=False で FD リーク回避             ★ NEW
+● fp16→fp32 キャストで dtype ミスマッチを解消              ★ NEW
 ● Hard Neg 80 % + Easy Neg 20 %、HardNeg は 2 epoch ごと再計算
 ● train loss と valAUC を同時に記録し、最良モデルを自動保存
 ● rank_follow_model.pt があればロードして続きから再開
@@ -86,9 +87,7 @@ class AttentionPool(nn.Module):
         self.sc   = nn.Linear(POST_DIM, 1, bias=False)
 
     def forward(self, x, m):
-        # ---------- dtype fix ----------
-        x = x.float()                       # ★ fp16 → fp32
-        # --------------------------------
+        x = x.float()                       # ★ fp16 → fp32 キャスト
         x = F.normalize(x, p=2, dim=-1)
         x = self.ln(x + self.mha(x, x, x, key_padding_mask=(m == 0))[0])
         w = F.softmax(self.sc(x).squeeze(-1).masked_fill(m == 0, -1e9), -1)
@@ -145,8 +144,8 @@ def compute_acc_vecs(cache, device, ap):
     with torch.no_grad():
         for i in range(0, len(users), 512):
             fp, fm = zip(*(cache[u] for u in users[i:i+512]))
-            fp = torch.stack(fp).to(device, non_blocking=True).float()   # ★
-            fm = torch.stack(fm).to(device, non_blocking=True).float()   # ★
+            fp = torch.stack(fp).to(device, non_blocking=True).float()
+            fm = torch.stack(fm).to(device, non_blocking=True).float()
             V[i:i + len(fp)] = ap(fp, fm)
     ap.to('cpu')
     return users, V
@@ -192,12 +191,17 @@ class TripletDS(Dataset):
 # ---- Validation -------------------------------------------------------
 def build_val_dl(val_edges, cache):
     users = list(cache.keys())
-    neg = [(f, random.choice(users)) for f, _ in val_edges]
-    ds = TripletDS(val_edges, neg, cache)
+    neg   = [(f, random.choice(users)) for f, _ in val_edges]
+    ds    = TripletDS(val_edges, neg, cache)
     return DataLoader(
-        ds, batch_size=512, shuffle=False,
-        num_workers=NUM_WORKERS, pin_memory=True,
-        multiprocessing_context="spawn" if NUM_WORKERS else None)
+        ds,
+        batch_size=512,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=False,                 # ★ FD リーク防止
+        multiprocessing_context="spawn" if NUM_WORKERS else None
+    )
 
 # ---- train loop -------------------------------------------------------
 def train():
@@ -230,20 +234,25 @@ def train():
 
         ds = TripletDS(train_e, hard + easy, post_cache)
         dl = DataLoader(
-            ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
-            num_workers=NUM_WORKERS, pin_memory=True,
-            persistent_workers=(NUM_WORKERS > 0),
-            multiprocessing_context="spawn" if NUM_WORKERS else None)
+            ds,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            drop_last=True,
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
+            persistent_workers=False,             # ★ ここも False
+            multiprocessing_context="spawn" if NUM_WORKERS else None
+        )
 
         # ---- train ----
         model.train(); tot = 0
         for fp, fm, tp, tm, np_, nm in tqdm(dl, desc=f"E{ep}"):
-            fp = fp.to(dev, non_blocking=True).float()  # ★
-            fm = fm.to(dev, non_blocking=True).float()  # ★
-            tp = tp.to(dev, non_blocking=True).float()  # ★
-            tm = tm.to(dev, non_blocking=True).float()  # ★
-            np_ = np_.to(dev, non_blocking=True).float()# ★
-            nm = nm.to(dev, non_blocking=True).float()  # ★
+            fp = fp.to(dev, non_blocking=True).float()
+            fm = fm.to(dev, non_blocking=True).float()
+            tp = tp.to(dev, non_blocking=True).float()
+            tm = tm.to(dev, non_blocking=True).float()
+            np_ = np_.to(dev, non_blocking=True).float()
+            nm = nm.to(dev, non_blocking=True).float()
 
             pos = model.score(fp, fm, tp, tm)
             neg = model.score(fp, fm, np_, nm)
@@ -256,12 +265,12 @@ def train():
         model.eval(); hit = total = 0
         with torch.no_grad():
             for fp, fm, tp, tm, np_, nm in val_dl:
-                fp = fp.to(dev, non_blocking=True).float()  # ★
-                fm = fm.to(dev, non_blocking=True).float()  # ★
-                tp = tp.to(dev, non_blocking=True).float()  # ★
-                tm = tm.to(dev, non_blocking=True).float()  # ★
-                np_ = np_.to(dev, non_blocking=True).float()# ★
-                nm = nm.to(dev, non_blocking=True).float()  # ★
+                fp = fp.to(dev, non_blocking=True).float()
+                fm = fm.to(dev, non_blocking=True).float()
+                tp = tp.to(dev, non_blocking=True).float()
+                tm = tm.to(dev, non_blocking=True).float()
+                np_ = np_.to(dev, non_blocking=True).float()
+                nm = nm.to(dev, non_blocking=True).float()
 
                 pos = model.score(fp, fm, tp, tm).sigmoid()
                 neg = model.score(fp, fm, np_, nm).sigmoid()
