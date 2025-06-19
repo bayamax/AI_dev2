@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 # ───── DIRS & HYPER ──────────────────────────────────
-BASE_DIR   = Path('/workspace/vast')
+BASE_DIR   = Path('/workspace/workspace/vast')
 POSTS_NPY  = BASE_DIR / 'aggregated_posting_vectors.npy'
 EDGES_CSV  = BASE_DIR / 'edges.csv'
 
