@@ -3,8 +3,8 @@
 """
 post_to_accountvector_ranked_fast_val.py
 ────────────────────────────────────────────────────────
-● 投稿 Tensor を fp32 でキャッシュ （FP16 は一旦オフ）
-● spawn 方式で DataLoader ワーカーを起動し CUDA エラーを回避 ★
+● 投稿 Tensor を **CPU + fp16** でキャッシュ → VRAM/ピン問題解消 ★
+● DataLoader は spawn + pin_memory=True（non-blocking copy） ★
 ● Hard Neg 80 % + Easy Neg 20 %、HardNeg は 2 epoch ごと再計算
 ● train loss と valAUC を同時に記録し、最良モデルを自動保存
 ● rank_follow_model.pt があればロードして続きから再開
@@ -21,9 +21,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import torch.multiprocessing as mp            # ★ 追加
+import torch.multiprocessing as mp
 
-# spawn 方式に固定（force=True で再実行時も上書き） ★
+# ★ CUDA 問題回避：spawn 方式を強制
 mp.set_start_method('spawn', force=True)
 
 # ───── DIRS & HYPER ──────────────────────────────────
@@ -48,8 +48,8 @@ HARD_TOPN     = 20
 EASY_NEG_RATE = 0.2
 VALID_RATIO   = 0.15
 HN_INTERVAL   = 2
-NUM_WORKERS   = 4                           # 並列プリフェッチしたいので 4 に
-FP16          = False                       # 必要なら後で True に
+NUM_WORKERS   = 4
+FP16          = True                           # ★ CPU キャッシュは fp16 に
 # ────────────────────────────────────────────────
 
 def log(msg: str):
@@ -120,28 +120,36 @@ def pad_posts(lst):
     return arr, msk
 
 def build_post_cache(posts, device):
+    """
+    ★ VRAM節約 & pin_memory 対応:
+      - すべて **CPU** (device='cpu') に置く
+      - dtype = fp16 でメモリ半減
+    """
     cache = {}
-    dtype = torch.float32
+    dtype = torch.float16 if FP16 else torch.float32
     for u, vecs in posts.items():
         fp, fm = pad_posts(vecs)
-        cache[u] = (torch.tensor(fp, dtype=dtype, device=device),
-                    torch.tensor(fm, dtype=dtype, device=device))
+        cache[u] = (
+            torch.tensor(fp, dtype=dtype, device='cpu'),
+            torch.tensor(fm, dtype=dtype, device='cpu'))
     return cache
 
 def compute_acc_vecs(cache, device, ap):
     users = list(cache.keys())
     V = torch.zeros((len(users), ACCOUNT_DIM), dtype=torch.float32, device=device)
-    ap.eval()
+    ap.to(device).eval()
     with torch.no_grad():
         for i in range(0, len(users), 512):
             fp, fm = zip(*(cache[u] for u in users[i:i+512]))
-            fp = torch.stack(fp); fm = torch.stack(fm)
+            fp = torch.stack(fp).to(device, non_blocking=True)
+            fm = torch.stack(fm).to(device, non_blocking=True)
             V[i:i + len(fp)] = ap(fp, fm)
+    ap.to('cpu')   # メモリ節約
     return users, V
 
 def hard_negs(users, V, pos_edges):
     idx = {u: i for i, u in enumerate(users)}
-    edge_set = set(map(tuple, pos_edges))           # pos_edges は list → tuple 化 ★
+    edge_set = set(map(tuple, pos_edges))
     sims = F.normalize(V, dim=1) @ F.normalize(V, dim=1).T
     neg = []
     for f, _ in pos_edges:
@@ -183,13 +191,9 @@ def build_val_dl(val_edges, cache):
     neg = [(f, random.choice(users)) for f, _ in val_edges]
     ds = TripletDS(val_edges, neg, cache)
     return DataLoader(
-        ds,
-        batch_size=512,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
-        multiprocessing_context="spawn" if NUM_WORKERS else None  # ★
-    )
+        ds, batch_size=512, shuffle=False,
+        num_workers=NUM_WORKERS, pin_memory=True,
+        multiprocessing_context="spawn" if NUM_WORKERS else None)
 
 # ---- train loop -------------------------------------------------------
 def train():
@@ -222,20 +226,21 @@ def train():
 
         ds = TripletDS(train_e, hard + easy, post_cache)
         dl = DataLoader(
-            ds,
-            batch_size=BATCH_SIZE,
-            shuffle=True,
-            drop_last=True,
-            num_workers=NUM_WORKERS,
-            pin_memory=True,
+            ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
+            num_workers=NUM_WORKERS, pin_memory=True,
             persistent_workers=(NUM_WORKERS > 0),
-            multiprocessing_context="spawn" if NUM_WORKERS else None  # ★
-        )
+            multiprocessing_context="spawn" if NUM_WORKERS else None)
 
         # ---- train ----
         model.train(); tot = 0
         for fp, fm, tp, tm, np_, nm in tqdm(dl, desc=f"E{ep}"):
-            fp, fm, tp, tm, np_, nm = [x.to(dev) for x in (fp, fm, tp, tm, np_, nm)]
+            fp = fp.to(dev, non_blocking=True)
+            fm = fm.to(dev, non_blocking=True)
+            tp = tp.to(dev, non_blocking=True)
+            tm = tm.to(dev, non_blocking=True)
+            np_ = np_.to(dev, non_blocking=True)
+            nm = nm.to(dev, non_blocking=True)
+
             pos = model.score(fp, fm, tp, tm)
             neg = model.score(fp, fm, np_, nm)
             loss = -torch.log(torch.sigmoid(pos - neg)).mean()
@@ -247,7 +252,13 @@ def train():
         model.eval(); hit = total = 0
         with torch.no_grad():
             for fp, fm, tp, tm, np_, nm in val_dl:
-                fp, fm, tp, tm, np_, nm = [x.to(dev) for x in (fp, fm, tp, tm, np_, nm)]
+                fp = fp.to(dev, non_blocking=True)
+                fm = fm.to(dev, non_blocking=True)
+                tp = tp.to(dev, non_blocking=True)
+                tm = tm.to(dev, non_blocking=True)
+                np_ = np_.to(dev, non_blocking=True)
+                nm = nm.to(dev, non_blocking=True)
+
                 pos = model.score(fp, fm, tp, tm).sigmoid()
                 neg = model.score(fp, fm, np_, nm).sigmoid()
                 hit += (pos > neg).sum().item()
