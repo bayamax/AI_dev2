@@ -3,8 +3,9 @@
 """
 post_to_accountvector_ranked_fast_val.py
 ────────────────────────────────────────────────────────
-● 投稿 Tensor を **CPU + fp16** でキャッシュ → VRAM/ピン問題解消 ★
-● DataLoader は spawn + pin_memory=True（non-blocking copy） ★
+● 投稿 Tensor を **CPU + fp16** でキャッシュ → VRAM/ピン問題解消
+● DataLoader は spawn + pin_memory=True（non-blocking copy）
+● dtype ミスマッチを解消（fp16→fp32 キャスト）          ★ NEW
 ● Hard Neg 80 % + Easy Neg 20 %、HardNeg は 2 epoch ごと再計算
 ● train loss と valAUC を同時に記録し、最良モデルを自動保存
 ● rank_follow_model.pt があればロードして続きから再開
@@ -85,6 +86,9 @@ class AttentionPool(nn.Module):
         self.sc   = nn.Linear(POST_DIM, 1, bias=False)
 
     def forward(self, x, m):
+        # ---------- dtype fix ----------
+        x = x.float()                       # ★ fp16 → fp32
+        # --------------------------------
         x = F.normalize(x, p=2, dim=-1)
         x = self.ln(x + self.mha(x, x, x, key_padding_mask=(m == 0))[0])
         w = F.softmax(self.sc(x).squeeze(-1).masked_fill(m == 0, -1e9), -1)
@@ -141,10 +145,10 @@ def compute_acc_vecs(cache, device, ap):
     with torch.no_grad():
         for i in range(0, len(users), 512):
             fp, fm = zip(*(cache[u] for u in users[i:i+512]))
-            fp = torch.stack(fp).to(device, non_blocking=True)
-            fm = torch.stack(fm).to(device, non_blocking=True)
+            fp = torch.stack(fp).to(device, non_blocking=True).float()   # ★
+            fm = torch.stack(fm).to(device, non_blocking=True).float()   # ★
             V[i:i + len(fp)] = ap(fp, fm)
-    ap.to('cpu')   # メモリ節約
+    ap.to('cpu')
     return users, V
 
 def hard_negs(users, V, pos_edges):
@@ -234,12 +238,12 @@ def train():
         # ---- train ----
         model.train(); tot = 0
         for fp, fm, tp, tm, np_, nm in tqdm(dl, desc=f"E{ep}"):
-            fp = fp.to(dev, non_blocking=True)
-            fm = fm.to(dev, non_blocking=True)
-            tp = tp.to(dev, non_blocking=True)
-            tm = tm.to(dev, non_blocking=True)
-            np_ = np_.to(dev, non_blocking=True)
-            nm = nm.to(dev, non_blocking=True)
+            fp = fp.to(dev, non_blocking=True).float()  # ★
+            fm = fm.to(dev, non_blocking=True).float()  # ★
+            tp = tp.to(dev, non_blocking=True).float()  # ★
+            tm = tm.to(dev, non_blocking=True).float()  # ★
+            np_ = np_.to(dev, non_blocking=True).float()# ★
+            nm = nm.to(dev, non_blocking=True).float()  # ★
 
             pos = model.score(fp, fm, tp, tm)
             neg = model.score(fp, fm, np_, nm)
@@ -252,12 +256,12 @@ def train():
         model.eval(); hit = total = 0
         with torch.no_grad():
             for fp, fm, tp, tm, np_, nm in val_dl:
-                fp = fp.to(dev, non_blocking=True)
-                fm = fm.to(dev, non_blocking=True)
-                tp = tp.to(dev, non_blocking=True)
-                tm = tm.to(dev, non_blocking=True)
-                np_ = np_.to(dev, non_blocking=True)
-                nm = nm.to(dev, non_blocking=True)
+                fp = fp.to(dev, non_blocking=True).float()  # ★
+                fm = fm.to(dev, non_blocking=True).float()  # ★
+                tp = tp.to(dev, non_blocking=True).float()  # ★
+                tm = tm.to(dev, non_blocking=True).float()  # ★
+                np_ = np_.to(dev, non_blocking=True).float()# ★
+                nm = nm.to(dev, non_blocking=True).float()  # ★
 
                 pos = model.score(fp, fm, tp, tm).sigmoid()
                 neg = model.score(fp, fm, np_, nm).sigmoid()
