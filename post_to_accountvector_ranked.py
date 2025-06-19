@@ -3,8 +3,8 @@
 """
 post_to_accountvector_ranked_fast_val.py
 ────────────────────────────────────────────────────────
-● 投稿 Tensor を fp16 でキャッシュ → 1 epoch ≈ 1 h（Titan X 12 GB）
-● AMP + GradScaler で半精度学習
+● 投稿 Tensor を fp32 でキャッシュ （FP16 は一旦オフ）
+● AMP + GradScaler で半精度学習は後で切り替え可
 ● Hard Neg 80 % + Easy Neg 20 %、HardNeg は 2 epoch ごと再計算
 ● train loss と valAUC を同時に記録し、最良モデルを自動保存
 ● rank_follow_model.pt があればロードして続きから再開
@@ -45,7 +45,7 @@ EASY_NEG_RATE = 0.2
 VALID_RATIO   = 0.15
 HN_INTERVAL   = 2
 NUM_WORKERS   = 4
-FP16          = True                           # 端末の VRAM に応じて False でも可
+FP16          = False                          # ← 半精度を一旦オフ
 # ────────────────────────────────────────────────
 
 def log(msg: str):
@@ -117,7 +117,7 @@ def pad_posts(lst):
 
 def build_post_cache(posts, device):
     cache = {}
-    dtype = torch.float16 if FP16 else torch.float32
+    dtype = torch.float32                       # ← FP32で統一
     for u, vecs in posts.items():
         fp, fm = pad_posts(vecs)
         cache[u] = (torch.tensor(fp, dtype=dtype, device=device),
@@ -126,7 +126,7 @@ def build_post_cache(posts, device):
 
 def compute_acc_vecs(cache, device, ap):
     users = list(cache.keys())
-    dtype = torch.float16 if FP16 else torch.float32
+    dtype = torch.float32
     V = torch.zeros((len(users), ACCOUNT_DIM), dtype=dtype, device=device)
     ap.eval()
     with torch.no_grad():
@@ -201,7 +201,6 @@ def train():
         log("checkpoint loaded → 再開")
 
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
-    scaler = torch.cuda.amp.GradScaler(enabled=FP16)
 
     best_auc, wait = 0.0, 0
     for ep in range(1, NUM_EPOCHS + 1):
@@ -220,13 +219,10 @@ def train():
         model.train(); tot = 0
         for fp, fm, tp, tm, np_, nm in tqdm(dl, desc=f"E{ep}"):
             fp, fm, tp, tm, np_, nm = [x.to(dev) for x in (fp, fm, tp, tm, np_, nm)]
-            with torch.cuda.amp.autocast(enabled=FP16):
-                pos = model.score(fp, fm, tp, tm)
-                neg = model.score(fp, fm, np_, nm)
-                loss = -torch.log(torch.sigmoid(pos - neg)).mean()
-            opt.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(opt); scaler.update()
+            pos = model.score(fp, fm, tp, tm)
+            neg = model.score(fp, fm, np_, nm)
+            loss = -torch.log(torch.sigmoid(pos - neg)).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
             tot += loss.item() * len(pos)
         train_loss = tot / len(ds)
 
