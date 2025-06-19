@@ -4,16 +4,15 @@
 post_to_accountvector_ranked_fast_val.py
 ────────────────────────────────────────────────────────
 ● 投稿 Tensor を **CPU + fp16** でキャッシュ → VRAM/ピン問題解消
-● DataLoader は spawn + pin_memory=True
-   ↳ persistent_workers=False で FD リーク回避             ★ NEW
-● fp16→fp32 キャストで dtype ミスマッチを解消              ★ NEW
+● DataLoader の worker=0 で FD リーク根絶                      ★ NEW
+● fp16→fp32 キャストで dtype ミスマッチを解消                  ★ 先行修正
 ● Hard Neg 80 % + Easy Neg 20 %、HardNeg は 2 epoch ごと再計算
 ● train loss と valAUC を同時に記録し、最良モデルを自動保存
 ● rank_follow_model.pt があればロードして続きから再開
 """
 
 from pathlib import Path
-import csv, random, time, traceback
+import csv, random, time, traceback, gc
 from collections import defaultdict
 
 import numpy as np
@@ -50,14 +49,15 @@ HARD_TOPN     = 20
 EASY_NEG_RATE = 0.2
 VALID_RATIO   = 0.15
 HN_INTERVAL   = 2
-NUM_WORKERS   = 4
-FP16          = True                           # ★ CPU キャッシュは fp16 に
+NUM_WORKERS   = 0                          # ★ もう FD を開かない
+FP16          = True                       # ★ CPU キャッシュを fp16
 # ────────────────────────────────────────────────
 
 def log(msg: str):
     ts = time.strftime('%Y-%m-%d %H:%M:%S')
     print(f"{ts}  {msg}")
-    with LOG_FILE.open('a') as f: f.write(f"{ts}  {msg}\n")
+    with LOG_FILE.open('a') as f:
+        f.write(f"{ts}  {msg}\n")
 
 # ---- load / split data ------------------------------------------------
 def load_posts():
@@ -87,7 +87,7 @@ class AttentionPool(nn.Module):
         self.sc   = nn.Linear(POST_DIM, 1, bias=False)
 
     def forward(self, x, m):
-        x = x.float()                       # ★ fp16 → fp32 キャスト
+        x = x.float()                       # fp16 → fp32
         x = F.normalize(x, p=2, dim=-1)
         x = self.ln(x + self.mha(x, x, x, key_padding_mask=(m == 0))[0])
         w = F.softmax(self.sc(x).squeeze(-1).masked_fill(m == 0, -1e9), -1)
@@ -119,15 +119,12 @@ def pad_posts(lst):
     arr = np.zeros((MAX_POSTS, POST_DIM), np.float32)
     msk = np.zeros(MAX_POSTS, np.float32)
     L = min(len(lst), MAX_POSTS)
-    if L: arr[:L] = lst[:L]; msk[:L] = 1
+    if L:
+        arr[:L] = lst[:L]
+        msk[:L] = 1
     return arr, msk
 
-def build_post_cache(posts, device):
-    """
-    ★ VRAM節約 & pin_memory 対応:
-      - すべて **CPU** (device='cpu') に置く
-      - dtype = fp16 でメモリ半減
-    """
+def build_post_cache(posts):
     cache = {}
     dtype = torch.float16 if FP16 else torch.float32
     for u, vecs in posts.items():
@@ -170,7 +167,8 @@ def easy_negs(valid_users, pos_edges):
     neg = []
     while len(neg) < need:
         f, t = random.sample(valid_users, 2)
-        if (f, t) not in edge_set: neg.append((f, t))
+        if (f, t) not in edge_set:
+            neg.append((f, t))
     return neg
 
 # ---- Dataset ----------------------------------------------------------
@@ -178,9 +176,13 @@ class TripletDS(Dataset):
     def __init__(self, pos, neg, cache):
         self.cache = cache
         neg_by_f = defaultdict(list)
-        for f, n in neg: neg_by_f[f].append(n)
+        for f, n in neg:
+            neg_by_f[f].append(n)
         self.trip = [(f, p, n) for f, p in pos for n in neg_by_f[f]]
-    def __len__(self): return len(self.trip)
+
+    def __len__(self):
+        return len(self.trip)
+
     def __getitem__(self, i):
         f, p, n = self.trip[i]
         fp, fm = self.cache[f]
@@ -191,15 +193,14 @@ class TripletDS(Dataset):
 # ---- Validation -------------------------------------------------------
 def build_val_dl(val_edges, cache):
     users = list(cache.keys())
-    neg   = [(f, random.choice(users)) for f, _ in val_edges]
-    ds    = TripletDS(val_edges, neg, cache)
+    neg = [(f, random.choice(users)) for f, _ in val_edges]
+    ds = TripletDS(val_edges, neg, cache)
     return DataLoader(
         ds,
         batch_size=512,
         shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=True,
-        persistent_workers=False,                 # ★ FD リーク防止
         multiprocessing_context="spawn" if NUM_WORKERS else None
     )
 
@@ -214,7 +215,7 @@ def train():
     edges = [(u, v) for u, v in edges_all if u in valid_users and v in valid_users]
     train_e, val_e = split_edges(edges)
 
-    post_cache = build_post_cache(posts, dev)
+    post_cache = build_post_cache(posts)
     val_dl = build_val_dl(val_e, post_cache)
 
     model = Model().to(dev)
@@ -240,7 +241,6 @@ def train():
             drop_last=True,
             num_workers=NUM_WORKERS,
             pin_memory=True,
-            persistent_workers=False,             # ★ ここも False
             multiprocessing_context="spawn" if NUM_WORKERS else None
         )
 
@@ -288,6 +288,10 @@ def train():
             wait += 1
             if wait >= EARLY_STOP:
                 log("early stop"); break
+
+        # ---- 後片付け ----
+        del dl, ds
+        gc.collect()
 
 if __name__ == "__main__":
     try:
