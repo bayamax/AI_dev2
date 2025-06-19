@@ -3,9 +3,10 @@
 """
 post_to_accountvector_ranked_fast_val.py
 ────────────────────────────────────────────────────────
-● 投稿 Tensor を fp32 でキャッシュ（FP16 は一旦 OFF）
+● 投稿 Tensor を fp32 でキャッシュ （FP16 は一旦オフ）
+● spawn 方式で DataLoader ワーカーを起動し CUDA エラーを回避 ★
 ● Hard Neg 80 % + Easy Neg 20 %、HardNeg は 2 epoch ごと再計算
-● train loss と valAUC を記録し、最良モデルを自動保存
+● train loss と valAUC を同時に記録し、最良モデルを自動保存
 ● rank_follow_model.pt があればロードして続きから再開
 """
 
@@ -20,6 +21,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import torch.multiprocessing as mp            # ★ 追加
+
+# spawn 方式に固定（force=True で再実行時も上書き） ★
+mp.set_start_method('spawn', force=True)
 
 # ───── DIRS & HYPER ──────────────────────────────────
 BASE_DIR   = Path('/workspace/workspace/vast')
@@ -43,15 +48,14 @@ HARD_TOPN     = 20
 EASY_NEG_RATE = 0.2
 VALID_RATIO   = 0.15
 HN_INTERVAL   = 2
-NUM_WORKERS   = 4
-FP16          = False                       # ← 半精度 OFF
+NUM_WORKERS   = 4                           # 並列プリフェッチしたいので 4 に
+FP16          = False                       # 必要なら後で True に
 # ────────────────────────────────────────────────
 
 def log(msg: str):
     ts = time.strftime('%Y-%m-%d %H:%M:%S')
     print(f"{ts}  {msg}")
-    with LOG_FILE.open('a') as f:
-        f.write(f"{ts}  {msg}\n")
+    with LOG_FILE.open('a') as f: f.write(f"{ts}  {msg}\n")
 
 # ---- load / split data ------------------------------------------------
 def load_posts():
@@ -60,10 +64,9 @@ def load_posts():
 def load_edges():
     with EDGES_CSV.open() as f:
         rdr = csv.reader(f); next(rdr)
-        return [tuple(r[:2]) for r in rdr]           # ★ 常に tuple で返す
+        return [tuple(r[:2]) for r in rdr]
 
 def split_edges(edges):
-    edges = [tuple(e) for e in edges]                # ★ 念押しで tuple 化
     random.shuffle(edges)
     k = int(len(edges) * (1 - VALID_RATIO))
     np.save(TRAIN_NPY, np.array(edges[:k], dtype=object), allow_pickle=True)
@@ -113,9 +116,7 @@ def pad_posts(lst):
     arr = np.zeros((MAX_POSTS, POST_DIM), np.float32)
     msk = np.zeros(MAX_POSTS, np.float32)
     L = min(len(lst), MAX_POSTS)
-    if L:
-        arr[:L] = lst[:L]
-        msk[:L] = 1
+    if L: arr[:L] = lst[:L]; msk[:L] = 1
     return arr, msk
 
 def build_post_cache(posts, device):
@@ -127,42 +128,38 @@ def build_post_cache(posts, device):
                     torch.tensor(fm, dtype=dtype, device=device))
     return cache
 
-@torch.no_grad()
 def compute_acc_vecs(cache, device, ap):
     users = list(cache.keys())
-    V = torch.zeros((len(users), ACCOUNT_DIM),
-                    dtype=torch.float32, device=device)
+    V = torch.zeros((len(users), ACCOUNT_DIM), dtype=torch.float32, device=device)
     ap.eval()
-    for i in range(0, len(users), 512):
-        fp, fm = zip(*(cache[u] for u in users[i:i+512]))
-        fp = torch.stack(fp); fm = torch.stack(fm)
-        V[i:i + len(fp)] = ap(fp, fm)
+    with torch.no_grad():
+        for i in range(0, len(users), 512):
+            fp, fm = zip(*(cache[u] for u in users[i:i+512]))
+            fp = torch.stack(fp); fm = torch.stack(fm)
+            V[i:i + len(fp)] = ap(fp, fm)
     return users, V
 
 def hard_negs(users, V, pos_edges):
     idx = {u: i for i, u in enumerate(users)}
-
-    edge_set = set(pos_edges)                       # ★ pos_edges は tuple 化済
+    edge_set = set(map(tuple, pos_edges))           # pos_edges は list → tuple 化 ★
     sims = F.normalize(V, dim=1) @ F.normalize(V, dim=1).T
     neg = []
     for f, _ in pos_edges:
-        if f not in idx:
-            continue
+        if f not in idx: continue
         i = idx[f]
         _, ids = sims[i].topk(HARD_TOPN + 1)
-        cands = [users[j] for j in ids[1:].tolist()
-                 if (f, users[j]) not in edge_set]
+        cands = [users[j] for j in ids[1:].tolist() if (f, users[j]) not in edge_set]
         random.shuffle(cands)
         neg.extend([(f, u) for u in cands[:NEG_PER_POS]])
     return neg
 
 def easy_negs(valid_users, pos_edges):
     need = int(len(pos_edges) * EASY_NEG_RATE)
-    edge_set = set(pos_edges); neg = []
+    edge_set = set(map(tuple, pos_edges))
+    neg = []
     while len(neg) < need:
         f, t = random.sample(valid_users, 2)
-        if (f, t) not in edge_set:
-            neg.append((f, t))
+        if (f, t) not in edge_set: neg.append((f, t))
     return neg
 
 # ---- Dataset ----------------------------------------------------------
@@ -170,13 +167,9 @@ class TripletDS(Dataset):
     def __init__(self, pos, neg, cache):
         self.cache = cache
         neg_by_f = defaultdict(list)
-        for f, n in neg:
-            neg_by_f[f].append(n)
+        for f, n in neg: neg_by_f[f].append(n)
         self.trip = [(f, p, n) for f, p in pos for n in neg_by_f[f]]
-
-    def __len__(self):
-        return len(self.trip)
-
+    def __len__(self): return len(self.trip)
     def __getitem__(self, i):
         f, p, n = self.trip[i]
         fp, fm = self.cache[f]
@@ -189,8 +182,14 @@ def build_val_dl(val_edges, cache):
     users = list(cache.keys())
     neg = [(f, random.choice(users)) for f, _ in val_edges]
     ds = TripletDS(val_edges, neg, cache)
-    return DataLoader(ds, batch_size=512, shuffle=False,
-                      num_workers=NUM_WORKERS, pin_memory=True)
+    return DataLoader(
+        ds,
+        batch_size=512,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        multiprocessing_context="spawn" if NUM_WORKERS else None  # ★
+    )
 
 # ---- train loop -------------------------------------------------------
 def train():
@@ -215,16 +214,23 @@ def train():
 
     best_auc, wait = 0.0, 0
     for ep in range(1, NUM_EPOCHS + 1):
-        # HardNeg 更新
+        # HardNeg 更新タイミング
         if ep == 1 or ep % HN_INTERVAL == 0:
             users, V = compute_acc_vecs(post_cache, dev, model.ap)
             hard = hard_negs(users, V, train_e)
         easy = easy_negs(list(valid_users), train_e)
 
         ds = TripletDS(train_e, hard + easy, post_cache)
-        dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True,
-                        drop_last=True, num_workers=NUM_WORKERS,
-                        pin_memory=True, persistent_workers=True)
+        dl = DataLoader(
+            ds,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            drop_last=True,
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
+            persistent_workers=(NUM_WORKERS > 0),
+            multiprocessing_context="spawn" if NUM_WORKERS else None  # ★
+        )
 
         # ---- train ----
         model.train(); tot = 0
@@ -247,13 +253,13 @@ def train():
                 hit += (pos > neg).sum().item()
                 total += len(pos)
         val_auc = hit / total
-        log(f"[{ep:02d}] train {train_loss:.4f} | valAUC {val_auc:.3f}")
+        log(f"[{ep}] train {train_loss:.4f} | valAUC {val_auc:.3f}")
 
         # ---- checkpoint ----
         if val_auc > best_auc:
             best_auc, wait = val_auc, 0
             torch.save(model.state_dict(), CKPT_PATH)
-            log("   saved best checkpoint")
+            log("  saved best checkpoint")
         else:
             wait += 1
             if wait >= EARLY_STOP:
