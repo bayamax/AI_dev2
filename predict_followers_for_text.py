@@ -17,7 +17,7 @@ predict_followers_from_sequence.py
 """
 
 # ====== ★ OpenAI API キーをここに入力してください ======================
-OPENAI_API_KEY = "sk-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+OPENAI_API_KEY = ""
 # =======================================================================
 
 from pathlib import Path
