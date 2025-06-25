@@ -24,7 +24,14 @@ BSKY_IDENTIFIER  = os.getenv("BSKY_IDENTIFIER")         # 例: foo.bsky.social
 BSKY_APP_PASSWORD= os.getenv("BSKY_APP_PASSWORD")       # 例: xxxx-xxxx-xxxx-xxxx
 # ──────────────────────
 
-SEED_HANDLES = ["jay.bsky.social", "dwr", "skyfeed.news"]
+SEED_HANDLES = [
+    # 実在ユーザを複数指定すると探索が途切れにくい
+    "ngntrtr.bsky.social",
+    "uishig.bsky.social",
+    "mikapikazompz.bsky.social",
+    "purinharumaki.bsky.social",
+    "sora-sakurai.bsky.social",
+]
 BASE_ENDPOINT = "https://public.api.bsky.app/xrpc"
 EMB_MODEL, EMB_DIM, BATCH_EMB = "text-embedding-3-large", 1536, 96
 MIN_POSTS, MIN_LIKES, MIN_FOLLOWS = 1, 1, 1
