@@ -1,10 +1,8 @@
 #!/usr/bin/env python
 """
-collect_bsky.py  –  Bluesky 収集スクリプト v0.5
-────────────────────────────────────────────────────────
-* DEBUG ログ常時 ON
-* getPosts URI 連結修正済み
-* フォロー API 400/404 → 0 件扱い
+collect_bsky.py  –  Bluesky 収集スクリプト v0.6
+* Like 取得時に DID を使用 (repo=<did>)
+* DEBUG ログ常時 ON、閾値 1-1-1 で動作確認しやすい
 """
 
 from __future__ import annotations
@@ -31,12 +29,11 @@ SEED_HANDLES = [
 BASE_ENDPOINT = "https://public.api.bsky.app/xrpc"
 EMB_MODEL, EMB_DIM, BATCH_EMB = "text-embedding-3-large", 1536, 96
 
-# まずは 1-1-1 で動作確認
-MIN_POSTS, MIN_LIKES, MIN_FOLLOWS = 1, 1, 1
+MIN_POSTS, MIN_LIKES, MIN_FOLLOWS = 1, 1, 1   # ← 動くのを確認後、戻す
 MAX_POSTS_ACC, MAX_ACCOUNTS = 40, 55_000
 
 OUT_DIR = Path("dataset"); OUT_DIR.mkdir(exist_ok=True)
-LOGLEVEL = logging.DEBUG        # ← 必ず DEBUG 表示
+LOGLEVEL = logging.DEBUG
 # ──────────────────────────────
 
 
@@ -56,7 +53,7 @@ class EmbeddingStore:
         if not arr_path.exists():
             np.lib.format.open_memmap(arr_path, "w+", np.float32,
                                       shape=(n_rows, EMB_DIM))[:] = 0.
-        self.arr  = np.lib.format.open_memmap(arr_path, "r+", np.float32)
+        self.arr = np.lib.format.open_memmap(arr_path, "r+", np.float32)
         self.next = (self.db.execute("SELECT MAX(idx) FROM post").fetchone()[0] or -1) + 1
 
     def add(self, metas: List[Tuple[str,str,str]], vecs: np.ndarray):
@@ -78,26 +75,32 @@ class GraphStore:
               src TEXT,
               dst TEXT,
               UNIQUE(src,dst));
-            CREATE INDEX IF NOT EXISTS idx_src ON follow(src);
-        """)
+            CREATE INDEX IF NOT EXISTS idx_src ON follow(src);""")
     def add(self, src:str, dsts:Iterable[str]):
         self.db.executemany(
             "INSERT OR IGNORE INTO follow(src,dst) VALUES (?,?)",
-            [(src,d) for d in dsts])
-        self.db.commit()
+            [(src,d) for d in dsts]); self.db.commit()
 
 
 # ========= Bluesky API =========
 class BlueskyAPI:
-    def __init__(self, sess:aiohttp.ClientSession): self.sess=sess
+    def __init__(self, sess:aiohttp.ClientSession):
+        self.sess = sess
+        self._did_cache: Dict[str,str] = {}   # handle -> did
 
     async def _get(self, ep:str, **params)->Dict[str,Any]:
         url=f"{BASE_ENDPOINT}/{ep}"
         while True:
-            r=await self.sess.get(url, params=params, timeout=30)
+            r = await self.sess.get(url, params=params, timeout=30)
             if r.status in (502,503,504): await asyncio.sleep(5); continue
             if r.status==429: await asyncio.sleep(15); continue
             r.raise_for_status(); return await r.json()
+
+    async def _did(self, handle:str) -> str:
+        if handle in self._did_cache: return self._did_cache[handle]
+        js = await self._get("app.bsky.actor.getProfile", actor=handle)
+        self._did_cache[handle] = js["did"]
+        return js["did"]
 
     async def posts(self, actor:str, limit:int=MAX_POSTS_ACC):
         js=await self._get("app.bsky.feed.getAuthorFeed",
@@ -106,7 +109,7 @@ class BlueskyAPI:
             rec=it["post"]["record"]
             yield it["post"]["uri"], rec.get("text","")
 
-    async def follows(self, actor:str, limit:int=100) -> List[str]:
+    async def follows(self, actor:str, limit:int=100)->List[str]:
         try:
             js=await self._get("app.bsky.graph.getFollows",
                                actor=actor, limit=min(limit,100))
@@ -115,10 +118,11 @@ class BlueskyAPI:
             raise
         return [u["handle"] for u in js.get("follows", [])]
 
-    async def like_uris(self, actor:str, limit:int=MAX_POSTS_ACC) -> List[str]:
+    async def like_uris(self, actor:str, limit:int=MAX_POSTS_ACC)->List[str]:
+        did = await self._did(actor)
         try:
             js=await self._get("com.atproto.repo.listRecords",
-                               repo=actor, collection="app.bsky.feed.like",
+                               repo=did, collection="app.bsky.feed.like",
                                limit=min(limit,100))
         except ClientResponseError as e:
             if e.status==404: return []
@@ -126,9 +130,9 @@ class BlueskyAPI:
         return [rec["value"]["subject"]["uri"] for rec in js.get("records", [])]
 
     async def posts_by_uri(self, uris:List[str]) -> Dict[str,str]:
-        out:Dict[str,str]={}
+        out:Dict[str,str] = {}
         for chunk in [uris[i:i+25] for i in range(0,len(uris),25)]:
-            joined=",".join(chunk)                    # カンマ区切り
+            joined=",".join(chunk)
             js=await self._get("app.bsky.feed.getPosts", uris=joined)
             for p in js.get("posts", []):
                 txt=p["record"].get("text","")
