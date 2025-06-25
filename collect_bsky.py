@@ -1,11 +1,10 @@
 #!/usr/bin/env python
 """
-collect_bsky.py  –  Bluesky 収集スクリプト v0.4
+collect_bsky.py  –  Bluesky 収集スクリプト v0.5
 ────────────────────────────────────────────────────────
-* posts / likes / follows が 0 のとき DEBUG ログで理由を表示
-* getPosts の URI 連結を正規化（カンマ区切り）
-* フォロー API の 400/404 を 0 と解釈
-* 基本閾値を 1-1-1 に緩めてテストしやすく
+* DEBUG ログ常時 ON
+* getPosts URI 連結修正済み
+* フォロー API 400/404 → 0 件扱い
 """
 
 from __future__ import annotations
@@ -20,25 +19,24 @@ from tqdm.asyncio import tqdm_asyncio
 
 # ───────── ユーザ設定 ─────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or sys.exit("OPENAI_API_KEY 未設定")
+
 SEED_HANDLES = [
-    # 実在ユーザを複数指定すると探索が途切れにくい
-    "ngntrtr.bsky.social",
-    "uishig.bsky.social",
-    "mikapikazompz.bsky.social",
-    "purinharumaki.bsky.social",
-    "sora-sakurai.bsky.social",
+    "jay.bsky.social",
+    "sara.bsky.social",
+    "blaine",
+    "manifold.bsky.social",
+    "karlicoss.com",
 ]
 
 BASE_ENDPOINT = "https://public.api.bsky.app/xrpc"
 EMB_MODEL, EMB_DIM, BATCH_EMB = "text-embedding-3-large", 1536, 96
 
-# 閾値 ─ まずは 1-1-1 で動作確認してから戻すと良い
+# まずは 1-1-1 で動作確認
 MIN_POSTS, MIN_LIKES, MIN_FOLLOWS = 1, 1, 1
 MAX_POSTS_ACC, MAX_ACCOUNTS = 40, 55_000
 
 OUT_DIR = Path("dataset"); OUT_DIR.mkdir(exist_ok=True)
-
-LOGLEVEL = logging.INFO      # DEBUG にすると詳細ログ
+LOGLEVEL = logging.DEBUG        # ← 必ず DEBUG 表示
 # ──────────────────────────────
 
 
@@ -54,11 +52,11 @@ class EmbeddingStore:
               kind TEXT,
               UNIQUE(account,post_uri,kind));
         """)
-        path = OUT_DIR / "embeddings.npy"
-        if not path.exists():
-            np.lib.format.open_memmap(path, "w+", np.float32,
+        arr_path = OUT_DIR / "embeddings.npy"
+        if not arr_path.exists():
+            np.lib.format.open_memmap(arr_path, "w+", np.float32,
                                       shape=(n_rows, EMB_DIM))[:] = 0.
-        self.arr  = np.lib.format.open_memmap(path, "r+", np.float32)
+        self.arr  = np.lib.format.open_memmap(arr_path, "r+", np.float32)
         self.next = (self.db.execute("SELECT MAX(idx) FROM post").fetchone()[0] or -1) + 1
 
     def add(self, metas: List[Tuple[str,str,str]], vecs: np.ndarray):
@@ -130,7 +128,7 @@ class BlueskyAPI:
     async def posts_by_uri(self, uris:List[str]) -> Dict[str,str]:
         out:Dict[str,str]={}
         for chunk in [uris[i:i+25] for i in range(0,len(uris),25)]:
-            joined=",".join(chunk)                         # ← URI をカンマ連結
+            joined=",".join(chunk)                    # カンマ区切り
             js=await self._get("app.bsky.feed.getPosts", uris=joined)
             for p in js.get("posts", []):
                 txt=p["record"].get("text","")
@@ -143,8 +141,8 @@ openai.api_key = OPENAI_API_KEY
 async def embed_texts(texts:List[str]) -> np.ndarray:
     for _ in range(3):
         try:
-            res=await openai.embeddings.async_create(model=EMB_MODEL, input=texts)
-            return np.asarray([d["embedding"] for d in res.data], np.float32)
+            r=await openai.embeddings.async_create(model=EMB_MODEL, input=texts)
+            return np.asarray([d["embedding"] for d in r.data], np.float32)
         except openai.RateLimitError: await asyncio.sleep(5)
     raise RuntimeError("OpenAI embed failed (3 retries)")
 
