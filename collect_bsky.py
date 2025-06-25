@@ -1,10 +1,9 @@
 #!/usr/bin/env python
 """
-collect_bsky.py – Bluesky 収集スクリプト v0.9
-  • repo=<did> で Like 取得
-  • App Password 認証あり／なし両対応
-  • Accept: application/json を常時送信
-  • atproto 0.0.42 / 0.0.43 以降すべて互換
+collect_bsky_no_like.py  –  Bluesky 収集 (投稿+フォローのみ版)
+  • Like コレクションは呼ばない
+  • App Password 認証は投稿・フォロー取得だけに使う
+  • 投稿10件 / フォロー5件 を満たせば保存
 """
 
 from __future__ import annotations
@@ -18,11 +17,11 @@ from aiohttp import ClientResponseError
 from atproto import Client as BskyClient
 from tqdm.asyncio import tqdm_asyncio
 
-# ────── 環境変数 ──────
-OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")          or sys.exit("OPENAI_API_KEY 未設定")
-BSKY_IDENTIFIER  = os.getenv("BSKY_IDENTIFIER")         # 例: foo.bsky.social
-BSKY_APP_PASSWORD= os.getenv("BSKY_APP_PASSWORD")       # 例: xxxx-xxxx-xxxx-xxxx
-# ──────────────────────
+# ───── 環境変数 ─────
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")        or sys.exit("OPENAI_API_KEY 未設定")
+BSKY_IDENTIFIER  = os.getenv("BSKY_IDENTIFIER")       # 例: foo.bsky.social
+BSKY_APP_PASSWORD= os.getenv("BSKY_APP_PASSWORD")     # 例: xxxx-xxxx-xxxx-xxxx
+# ────────────────────
 
 SEED_HANDLES = [
     # 実在ユーザを複数指定すると探索が途切れにくい
@@ -34,30 +33,30 @@ SEED_HANDLES = [
 ]
 BASE_ENDPOINT = "https://public.api.bsky.app/xrpc"
 EMB_MODEL, EMB_DIM, BATCH_EMB = "text-embedding-3-large", 1536, 96
-MIN_POSTS, MIN_LIKES, MIN_FOLLOWS = 1, 1, 1
+MIN_POSTS, MIN_FOLLOWS = 10, 5           # Like 条件を外した
 MAX_POSTS_ACC, MAX_ACCOUNTS = 40, 55_000
 OUT_DIR = Path("dataset"); OUT_DIR.mkdir(exist_ok=True)
-LOGLEVEL = logging.DEBUG
-# ──────────────────────
+LOGLEVEL = logging.INFO
+# ────────────────────
 
 
 # ========= EmbeddingStore =========
 class EmbeddingStore:
-    def __init__(self, n_rows: int = 2_500_000):
+    def __init__(self, n_rows: int = 2_000_000):
         self.db = sqlite3.connect(OUT_DIR / "meta.db")
         self.db.executescript("""
-          CREATE TABLE IF NOT EXISTS post(
-            idx INTEGER PRIMARY KEY,
-            account TEXT,
-            post_uri TEXT,
-            kind TEXT,
-            UNIQUE(account,post_uri,kind));
+            CREATE TABLE IF NOT EXISTS post(
+              idx INTEGER PRIMARY KEY,
+              account TEXT,
+              post_uri TEXT,
+              kind TEXT,
+              UNIQUE(account,post_uri,kind));
         """)
         path = OUT_DIR / "embeddings.npy"
         if not path.exists():
             np.lib.format.open_memmap(path, "w+", np.float32,
                                       shape=(n_rows, EMB_DIM))[:] = 0.
-        self.arr  = np.lib.format.open_memmap(path, "r+", np.float32)
+        self.arr = np.lib.format.open_memmap(path, "r+", np.float32)
         self.next = (self.db.execute("SELECT MAX(idx) FROM post").fetchone()[0] or -1) + 1
 
     def add(self, metas: List[Tuple[str,str,str]], vecs: np.ndarray):
@@ -76,14 +75,15 @@ class GraphStore:
     def __init__(self):
         self.db = sqlite3.connect(OUT_DIR / "graph.db")
         self.db.executescript("""
-          CREATE TABLE IF NOT EXISTS follow(
-            src TEXT,
-            dst TEXT,
-            UNIQUE(src,dst));
-          CREATE INDEX IF NOT EXISTS idx_src ON follow(src);""")
+            CREATE TABLE IF NOT EXISTS follow(
+              src TEXT,
+              dst TEXT,
+              UNIQUE(src,dst));
+            CREATE INDEX IF NOT EXISTS idx_src ON follow(src);
+        """)
     def add(self, src:str, dsts:Iterable[str]):
         self.db.executemany(
-            "INSERT OR IGNORE INTO follow(src,dst) VALUES(?,?)",
+            "INSERT OR IGNORE INTO follow(src,dst) VALUES (?,?)",
             [(src,d) for d in dsts]); self.db.commit()
 
 
@@ -95,26 +95,21 @@ class BlueskyAPI:
 
         if BSKY_IDENTIFIER and BSKY_APP_PASSWORD:
             cl = BskyClient(); cl.login(BSKY_IDENTIFIER, BSKY_APP_PASSWORD)
-
-            # バージョン差吸収: 見つかった最初の attr を採用
             self.jwt = (
                 getattr(cl, "access_jwt", None)
                 or getattr(getattr(cl, "current_session", None) or object(), "accessJwt", None)
                 or getattr(getattr(cl, "session", None) or object(), "access_jwt", None)
                 or getattr(getattr(cl, "_session", None) or object(), "access_jwt", None)
             )
-            if not self.jwt:
-                raise RuntimeError("atproto ライブラリが想定外の構造で JWT を取得できません")
-
             logging.info(f"logged-in as {BSKY_IDENTIFIER}")
         else:
             self.jwt = None
-            logging.warning("AppPassword 未設定: Like は取得できません")
+            logging.info("認証なし (公開データのみ取得)")
 
     async def _get(self, ep:str, **params)->Dict[str,Any]:
         url=f"{BASE_ENDPOINT}/{ep}"
-        headers = {"Accept": "application/json"}
-        if self.jwt: headers["Authorization"] = f"Bearer {self.jwt}"
+        headers={"Accept":"application/json"}
+        if self.jwt: headers["Authorization"]=f"Bearer {self.jwt}"
         while True:
             r=await self.sess.get(url, params=params, headers=headers, timeout=30)
             if r.status in (502,503,504): await asyncio.sleep(5); continue
@@ -124,8 +119,7 @@ class BlueskyAPI:
     async def _did(self, handle:str)->str:
         if handle in self._did_cache: return self._did_cache[handle]
         js=await self._get("app.bsky.actor.getProfile", actor=handle)
-        did=js["did"].strip()
-        self._did_cache[handle]=did; return did
+        did=js["did"].strip(); self._did_cache[handle]=did; return did
 
     async def posts(self, actor:str, limit:int=MAX_POSTS_ACC):
         js=await self._get("app.bsky.feed.getAuthorFeed",
@@ -141,25 +135,6 @@ class BlueskyAPI:
             if e.status in (400,404): return []
             raise
         return [u["handle"] for u in js.get("follows", [])]
-
-    async def like_uris(self, actor:str, limit:int=MAX_POSTS_ACC)->List[str]:
-        if not self.jwt:
-            return []
-        did=await self._did(actor)
-        js=await self._get("com.atproto.repo.listRecords",
-                           repo=did, collection="app.bsky.feed.like",
-                           limit=min(limit,100))
-        return [rec["value"]["subject"]["uri"] for rec in js.get("records", [])]
-
-    async def posts_by_uri(self, uris:List[str])->Dict[str,str]:
-        out:Dict[str,str]={}
-        for chunk in [uris[i:i+25] for i in range(0,len(uris),25)]:
-            joined=",".join(chunk)
-            js=await self._get("app.bsky.feed.getPosts", uris=joined)
-            for p in js.get("posts", []):
-                txt=p["record"].get("text","")
-                if txt: out[p["uri"]]=txt
-        return out
 
 
 # ========= Embedding =========
@@ -192,8 +167,7 @@ class Crawler:
     async def seed(self, handles:List[str]): self.q.extend(handles)
 
     async def run(self):
-        vis=tqdm_asyncio(total=MAX_ACCOUNTS,desc="visited",unit="")
-        sto=tqdm_asyncio(total=MAX_ACCOUNTS,desc="stored ",unit="")
+        vis=tqdm_asyncio(total=MAX_ACCOUNTS, desc="visited"); sto=tqdm_asyncio(total=MAX_ACCOUNTS, desc="stored")
         while self.q and len(self.seen)<MAX_ACCOUNTS:
             actor=self.q.popleft()
             if actor in self.seen: continue
@@ -205,34 +179,27 @@ class Crawler:
                 logging.warning(f"{actor}: {e}")
 
     async def process_actor(self, actor:str)->bool:
-        logging.debug(f"▼ {actor}")
         posts=[p async for p in self.api.posts(actor)]
         follows=await self.api.follows(actor)
-        like_uri=await self.api.like_uris(actor)
-        like_posts=await self.api.posts_by_uri(like_uri[:MAX_POSTS_ACC])
 
-        logging.debug(
-            f"■ {actor} posts={len(posts)} likes_uri={len(like_uri)} "
-            f"likes_resolved={len(like_posts)} follows={len(follows)}")
+        logging.debug(f"{actor} posts={len(posts)} follows={len(follows)}")
 
         self.G.add(actor,follows)
         random.shuffle(follows); self.q.extend(follows[:50])
 
-        if (len(posts)<MIN_POSTS or len(like_posts)<MIN_LIKES or len(follows)<MIN_FOLLOWS):
+        if len(posts)<MIN_POSTS or len(follows)<MIN_FOLLOWS:
             return False
 
         async def gen():
             for uri,txt in posts[:MAX_POSTS_ACC]:
                 yield (actor,uri,"post"), txt
-            for uri,txt in like_posts.items():
-                yield (actor,uri,"like"), txt
-        await embed_stream(gen().__aiter__(), self.E); return True
+        await embed_stream(gen().__aiter__(), self.E)
+        return True
 
 
 # ========= main =========
 async def main():
-    logging.basicConfig(level=LOGLEVEL,
-                        format="%(asctime)s %(levelname)s: %(message)s")
+    logging.basicConfig(level=LOGLEVEL, format="%(asctime)s %(levelname)s: %(message)s")
     async with aiohttp.ClientSession() as sess:
         api=BlueskyAPI(sess); estore=EmbeddingStore(); gstore=GraphStore()
         crawler=Crawler(api,estore,gstore)
