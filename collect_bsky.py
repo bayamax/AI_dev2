@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """
-collect_bsky.py  –  Bluesky 収集スクリプト v0.8
+collect_bsky.py – Bluesky 収集スクリプト v0.9
   • repo=<did> で Like 取得
   • App Password 認証あり／なし両対応
   • Accept: application/json を常時送信
-  • atproto 0.0.42 / 0.0.43 互換
+  • atproto 0.0.42 / 0.0.43 以降すべて互換
 """
 
 from __future__ import annotations
@@ -20,14 +20,14 @@ from tqdm.asyncio import tqdm_asyncio
 
 # ────── 環境変数 ──────
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")          or sys.exit("OPENAI_API_KEY 未設定")
-BSKY_IDENTIFIER  = os.getenv("BSKY_IDENTIFIER")         # 任意 (例: foo.bsky.social)
-BSKY_APP_PASSWORD= os.getenv("BSKY_APP_PASSWORD")       # 任意 16桁
+BSKY_IDENTIFIER  = os.getenv("BSKY_IDENTIFIER")         # 例: foo.bsky.social
+BSKY_APP_PASSWORD= os.getenv("BSKY_APP_PASSWORD")       # 例: xxxx-xxxx-xxxx-xxxx
 # ──────────────────────
 
 SEED_HANDLES = ["jay.bsky.social", "dwr", "skyfeed.news"]
 BASE_ENDPOINT = "https://public.api.bsky.app/xrpc"
 EMB_MODEL, EMB_DIM, BATCH_EMB = "text-embedding-3-large", 1536, 96
-MIN_POSTS, MIN_LIKES, MIN_FOLLOWS = 1, 1, 1            # 動いたら戻す
+MIN_POSTS, MIN_LIKES, MIN_FOLLOWS = 1, 1, 1
 MAX_POSTS_ACC, MAX_ACCOUNTS = 40, 55_000
 OUT_DIR = Path("dataset"); OUT_DIR.mkdir(exist_ok=True)
 LOGLEVEL = logging.DEBUG
@@ -88,8 +88,17 @@ class BlueskyAPI:
 
         if BSKY_IDENTIFIER and BSKY_APP_PASSWORD:
             cl = BskyClient(); cl.login(BSKY_IDENTIFIER, BSKY_APP_PASSWORD)
-            # バージョン互換
-            self.jwt = getattr(cl, "access_jwt", None) or getattr(cl.current_session, "accessJwt")
+
+            # バージョン差吸収: 見つかった最初の attr を採用
+            self.jwt = (
+                getattr(cl, "access_jwt", None)
+                or getattr(getattr(cl, "current_session", None) or object(), "accessJwt", None)
+                or getattr(getattr(cl, "session", None) or object(), "access_jwt", None)
+                or getattr(getattr(cl, "_session", None) or object(), "access_jwt", None)
+            )
+            if not self.jwt:
+                raise RuntimeError("atproto ライブラリが想定外の構造で JWT を取得できません")
+
             logging.info(f"logged-in as {BSKY_IDENTIFIER}")
         else:
             self.jwt = None
@@ -108,7 +117,7 @@ class BlueskyAPI:
     async def _did(self, handle:str)->str:
         if handle in self._did_cache: return self._did_cache[handle]
         js=await self._get("app.bsky.actor.getProfile", actor=handle)
-        did=js["did"].strip()           # 改行保険
+        did=js["did"].strip()
         self._did_cache[handle]=did; return did
 
     async def posts(self, actor:str, limit:int=MAX_POSTS_ACC):
@@ -127,7 +136,7 @@ class BlueskyAPI:
         return [u["handle"] for u in js.get("follows", [])]
 
     async def like_uris(self, actor:str, limit:int=MAX_POSTS_ACC)->List[str]:
-        if not self.jwt:      # 未ログイン時は Like 取得不可
+        if not self.jwt:
             return []
         did=await self._did(actor)
         js=await self._get("com.atproto.repo.listRecords",
