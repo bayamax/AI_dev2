@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """
-collect_bsky.py  –  Bluesky 収集スクリプト（ワンファイル版・limit 修正版）
-依存:  pip install aiohttp openai atproto numpy torch tqdm
+collect_bsky.py  –  Bluesky 収集スクリプト v0.3
+* 二重訪問ループ修正
+* プログレスバー 2 本化
 """
 
 from __future__ import annotations
@@ -26,10 +27,9 @@ SEED_HANDLES = [
 ]
 
 BASE_ENDPOINT = "https://public.api.bsky.app/xrpc"
-
 EMB_MODEL, EMB_DIM, BATCH_EMB = "text-embedding-3-large", 1536, 96
 MIN_POSTS, MIN_LIKES, MIN_FOLLOWS = 10, 10, 20
-MAX_POSTS_ACC, MAX_ACCOUNTS = 40, 55_000          # 55k ≒ 6.8 GB
+MAX_POSTS_ACC, MAX_ACCOUNTS = 40, 55_000
 OUT_DIR = Path("dataset"); OUT_DIR.mkdir(exist_ok=True)
 LOGLEVEL = logging.INFO
 # ──────────────────────────────
@@ -39,7 +39,8 @@ LOGLEVEL = logging.INFO
 class EmbeddingStore:
     def __init__(self, n_rows: int = 2_500_000):
         self.db = sqlite3.connect(OUT_DIR / "meta.db")
-        self.db.executescript("""CREATE TABLE IF NOT EXISTS post(
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS post(
               idx INTEGER PRIMARY KEY, account TEXT, post_uri TEXT, kind TEXT,
               UNIQUE(account,post_uri,kind));
         """)
@@ -63,9 +64,10 @@ class EmbeddingStore:
 class GraphStore:
     def __init__(self):
         self.db = sqlite3.connect(OUT_DIR / "graph.db")
-        self.db.executescript("""CREATE TABLE IF NOT EXISTS follow(
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS follow(
               src TEXT, dst TEXT, UNIQUE(src,dst));
-              CREATE INDEX IF NOT EXISTS idx_src ON follow(src);""")
+            CREATE INDEX IF NOT EXISTS idx_src ON follow(src);""")
     def add(self, src:str, dsts:Iterable[str]):
         self.db.executemany("INSERT OR IGNORE INTO follow(src,dst) VALUES (?,?)",
                             [(src,d) for d in dsts]); self.db.commit()
@@ -83,12 +85,18 @@ class BlueskyAPI:
             r.raise_for_status(); return await r.json()
 
     async def posts(self, actor:str, limit:int=MAX_POSTS_ACC):
-        js=await self._get("app.bsky.feed.getAuthorFeed", actor=actor, limit=min(limit,100))
+        js=await self._get("app.bsky.feed.getAuthorFeed",
+                           actor=actor, limit=min(limit,100))
         for it in js.get("feed", []):
             rec=it["post"]["record"]; yield it["post"]["uri"], rec.get("text","")
 
     async def follows(self, actor:str, limit:int=100) -> List[str]:
-        js=await self._get("app.bsky.graph.getFollows", actor=actor, limit=min(limit,100))
+        try:
+            js=await self._get("app.bsky.graph.getFollows",
+                               actor=actor, limit=min(limit,100))
+        except ClientResponseError as e:
+            if e.status in (400,404): return []
+            raise
         return [u["handle"] for u in js.get("follows", [])]
 
     async def like_uris(self, actor:str, limit:int=MAX_POSTS_ACC) -> List[str]:
@@ -137,17 +145,25 @@ class Crawler:
     def __init__(self, api:BlueskyAPI, estore:EmbeddingStore, gstore:GraphStore):
         self.api, self.E, self.G = api, estore, gstore
         self.seen:set[str]=set(); self.q:deque[str]=deque()
+        self.done=0  # しきい値を満たした件数
 
     async def seed(self, handles:List[str]): self.q.extend(handles)
 
     async def run(self):
-        p=tqdm_asyncio(total=MAX_ACCOUNTS, desc="accounts")
+        visited_bar = tqdm_asyncio(total=MAX_ACCOUNTS,
+                                   desc="visited", unit="")
+        good_bar    = tqdm_asyncio(total=MAX_ACCOUNTS,
+                                   desc="stored ", unit="")
         while self.q and len(self.seen)<MAX_ACCOUNTS:
             actor=self.q.popleft()
             if actor in self.seen: continue
+            self.seen.add(actor)                # ★ここで必ずマーク
+            visited_bar.update(1)
             try:
                 ok=await self.process_actor(actor)
-                if ok: self.seen.add(actor); p.update(1)
+                if ok:
+                    self.done+=1
+                    good_bar.update(1)
             except Exception as e:
                 logging.warning(f"{actor}: {e}")
 
@@ -164,7 +180,6 @@ class Crawler:
         if (len(posts)<MIN_POSTS or len(like_posts)<MIN_LIKES or len(follows)<MIN_FOLLOWS):
             return False
 
-        # 保存
         async def gen():
             for uri,txt in posts[:MAX_POSTS_ACC]:
                 yield (actor,uri,"post"), txt
