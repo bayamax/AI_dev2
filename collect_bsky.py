@@ -1,8 +1,11 @@
 #!/usr/bin/env python
 """
-collect_bsky.py  –  Bluesky 収集スクリプト v0.3
-* 二重訪問ループ修正
-* プログレスバー 2 本化
+collect_bsky.py  –  Bluesky 収集スクリプト v0.4
+────────────────────────────────────────────────────────
+* posts / likes / follows が 0 のとき DEBUG ログで理由を表示
+* getPosts の URI 連結を正規化（カンマ区切り）
+* フォロー API の 400/404 を 0 と解釈
+* 基本閾値を 1-1-1 に緩めてテストしやすく
 """
 
 from __future__ import annotations
@@ -28,10 +31,14 @@ SEED_HANDLES = [
 
 BASE_ENDPOINT = "https://public.api.bsky.app/xrpc"
 EMB_MODEL, EMB_DIM, BATCH_EMB = "text-embedding-3-large", 1536, 96
-MIN_POSTS, MIN_LIKES, MIN_FOLLOWS = 10, 10, 20
+
+# 閾値 ─ まずは 1-1-1 で動作確認してから戻すと良い
+MIN_POSTS, MIN_LIKES, MIN_FOLLOWS = 1, 1, 1
 MAX_POSTS_ACC, MAX_ACCOUNTS = 40, 55_000
+
 OUT_DIR = Path("dataset"); OUT_DIR.mkdir(exist_ok=True)
-LOGLEVEL = logging.INFO
+
+LOGLEVEL = logging.INFO      # DEBUG にすると詳細ログ
 # ──────────────────────────────
 
 
@@ -41,14 +48,17 @@ class EmbeddingStore:
         self.db = sqlite3.connect(OUT_DIR / "meta.db")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS post(
-              idx INTEGER PRIMARY KEY, account TEXT, post_uri TEXT, kind TEXT,
+              idx INTEGER PRIMARY KEY,
+              account TEXT,
+              post_uri TEXT,
+              kind TEXT,
               UNIQUE(account,post_uri,kind));
         """)
         path = OUT_DIR / "embeddings.npy"
         if not path.exists():
             np.lib.format.open_memmap(path, "w+", np.float32,
                                       shape=(n_rows, EMB_DIM))[:] = 0.
-        self.arr = np.lib.format.open_memmap(path, "r+", np.float32)
+        self.arr  = np.lib.format.open_memmap(path, "r+", np.float32)
         self.next = (self.db.execute("SELECT MAX(idx) FROM post").fetchone()[0] or -1) + 1
 
     def add(self, metas: List[Tuple[str,str,str]], vecs: np.ndarray):
@@ -56,8 +66,9 @@ class EmbeddingStore:
         if self.next + n > self.arr.shape[0]:
             raise RuntimeError("mmap full – 拡張してください")
         self.arr[self.next:self.next+n] = vecs
-        self.db.executemany("INSERT OR IGNORE INTO post(idx,account,post_uri,kind) VALUES (?,?,?,?)",
-                            [(self.next+i,*m) for i,m in enumerate(metas)])
+        self.db.executemany(
+            "INSERT OR IGNORE INTO post(idx,account,post_uri,kind) VALUES (?,?,?,?)",
+            [(self.next+i,*m) for i,m in enumerate(metas)])
         self.db.commit();  self.next += n
 
 
@@ -66,16 +77,22 @@ class GraphStore:
         self.db = sqlite3.connect(OUT_DIR / "graph.db")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS follow(
-              src TEXT, dst TEXT, UNIQUE(src,dst));
-            CREATE INDEX IF NOT EXISTS idx_src ON follow(src);""")
+              src TEXT,
+              dst TEXT,
+              UNIQUE(src,dst));
+            CREATE INDEX IF NOT EXISTS idx_src ON follow(src);
+        """)
     def add(self, src:str, dsts:Iterable[str]):
-        self.db.executemany("INSERT OR IGNORE INTO follow(src,dst) VALUES (?,?)",
-                            [(src,d) for d in dsts]); self.db.commit()
+        self.db.executemany(
+            "INSERT OR IGNORE INTO follow(src,dst) VALUES (?,?)",
+            [(src,d) for d in dsts])
+        self.db.commit()
 
 
 # ========= Bluesky API =========
 class BlueskyAPI:
     def __init__(self, sess:aiohttp.ClientSession): self.sess=sess
+
     async def _get(self, ep:str, **params)->Dict[str,Any]:
         url=f"{BASE_ENDPOINT}/{ep}"
         while True:
@@ -88,7 +105,8 @@ class BlueskyAPI:
         js=await self._get("app.bsky.feed.getAuthorFeed",
                            actor=actor, limit=min(limit,100))
         for it in js.get("feed", []):
-            rec=it["post"]["record"]; yield it["post"]["uri"], rec.get("text","")
+            rec=it["post"]["record"]
+            yield it["post"]["uri"], rec.get("text","")
 
     async def follows(self, actor:str, limit:int=100) -> List[str]:
         try:
@@ -112,10 +130,11 @@ class BlueskyAPI:
     async def posts_by_uri(self, uris:List[str]) -> Dict[str,str]:
         out:Dict[str,str]={}
         for chunk in [uris[i:i+25] for i in range(0,len(uris),25)]:
-            params=[("uris",u) for u in chunk]
-            js=await self._get("app.bsky.feed.getPosts", **dict(params))
+            joined=",".join(chunk)                         # ← URI をカンマ連結
+            js=await self._get("app.bsky.feed.getPosts", uris=joined)
             for p in js.get("posts", []):
-                out[p["uri"]] = p["record"].get("text","")
+                txt=p["record"].get("text","")
+                if txt: out[p["uri"]] = txt
         return out
 
 
@@ -145,35 +164,34 @@ class Crawler:
     def __init__(self, api:BlueskyAPI, estore:EmbeddingStore, gstore:GraphStore):
         self.api, self.E, self.G = api, estore, gstore
         self.seen:set[str]=set(); self.q:deque[str]=deque()
-        self.done=0  # しきい値を満たした件数
 
     async def seed(self, handles:List[str]): self.q.extend(handles)
 
     async def run(self):
-        visited_bar = tqdm_asyncio(total=MAX_ACCOUNTS,
-                                   desc="visited", unit="")
-        good_bar    = tqdm_asyncio(total=MAX_ACCOUNTS,
-                                   desc="stored ", unit="")
+        visited=tqdm_asyncio(total=MAX_ACCOUNTS, desc="visited", unit="")
+        stored =tqdm_asyncio(total=MAX_ACCOUNTS, desc="stored ", unit="")
         while self.q and len(self.seen)<MAX_ACCOUNTS:
             actor=self.q.popleft()
             if actor in self.seen: continue
-            self.seen.add(actor)                # ★ここで必ずマーク
-            visited_bar.update(1)
+            self.seen.add(actor); visited.update(1)
             try:
                 ok=await self.process_actor(actor)
-                if ok:
-                    self.done+=1
-                    good_bar.update(1)
+                if ok: stored.update(1)
             except Exception as e:
                 logging.warning(f"{actor}: {e}")
 
     async def process_actor(self, actor:str)->bool:
-        posts=[p async for p in self.api.posts(actor)]
-        follows=await self.api.follows(actor)
-        like_uris=await self.api.like_uris(actor)
-        like_posts=await self.api.posts_by_uri(like_uris[:MAX_POSTS_ACC])
+        logging.debug(f"▼ {actor} 収集中 …")
+        posts    =[p async for p in self.api.posts(actor)]
+        follows  =await self.api.follows(actor)
+        like_uri =await self.api.like_uris(actor)
+        like_posts=await self.api.posts_by_uri(like_uri[:MAX_POSTS_ACC])
 
-        # グラフは常に保存・探索
+        logging.debug(
+            f"■ {actor} posts={len(posts)} likes_uri={len(like_uri)} "
+            f"likes_resolved={len(like_posts)} follows={len(follows)}")
+
+        # グラフ保存・探索
         self.G.add(actor, follows)
         random.shuffle(follows); self.q.extend(follows[:50])
 
