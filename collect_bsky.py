@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """
-collect_bsky.py  –  Bluesky 収集スクリプト v0.7
+collect_bsky.py  –  Bluesky 収集スクリプト v0.8
   • repo=<did> で Like 取得
-  • AppPassword をセットすれば認証付き、無くても匿名で動作
-  • LOGLEVEL=DEBUG で投稿/Like/フォロー件数を逐次表示
+  • App Password 認証あり／なし両対応
+  • Accept: application/json を常時送信
+  • atproto 0.0.42 / 0.0.43 互換
 """
 
 from __future__ import annotations
@@ -23,14 +24,7 @@ BSKY_IDENTIFIER  = os.getenv("BSKY_IDENTIFIER")         # 任意 (例: foo.bsky.
 BSKY_APP_PASSWORD= os.getenv("BSKY_APP_PASSWORD")       # 任意 16桁
 # ──────────────────────
 
-SEED_HANDLES = [
-    # 実在ユーザを複数指定すると探索が途切れにくい
-    "ngntrtr.bsky.social",
-    "uishig.bsky.social",
-    "mikapikazompz.bsky.social",
-    "purinharumaki.bsky.social",
-    "sora-sakurai.bsky.social",
-]
+SEED_HANDLES = ["jay.bsky.social", "dwr", "skyfeed.news"]
 BASE_ENDPOINT = "https://public.api.bsky.app/xrpc"
 EMB_MODEL, EMB_DIM, BATCH_EMB = "text-embedding-3-large", 1536, 96
 MIN_POSTS, MIN_LIKES, MIN_FOLLOWS = 1, 1, 1            # 動いたら戻す
@@ -54,9 +48,9 @@ class EmbeddingStore:
         """)
         path = OUT_DIR / "embeddings.npy"
         if not path.exists():
-            np.lib.format.open_memmap(path, mode="w+", dtype=np.float32,
-                                      shape=(n_rows, EMB_DIM))[:] = 0
-        self.arr  = np.lib.format.open_memmap(path, mode="r+", dtype=np.float32)
+            np.lib.format.open_memmap(path, "w+", np.float32,
+                                      shape=(n_rows, EMB_DIM))[:] = 0.
+        self.arr  = np.lib.format.open_memmap(path, "r+", np.float32)
         self.next = (self.db.execute("SELECT MAX(idx) FROM post").fetchone()[0] or -1) + 1
 
     def add(self, metas: List[Tuple[str,str,str]], vecs: np.ndarray):
@@ -79,32 +73,32 @@ class GraphStore:
             src TEXT,
             dst TEXT,
             UNIQUE(src,dst));
-          CREATE INDEX IF NOT EXISTS idx_src ON follow(src);
-        """)
+          CREATE INDEX IF NOT EXISTS idx_src ON follow(src);""")
     def add(self, src:str, dsts:Iterable[str]):
         self.db.executemany(
             "INSERT OR IGNORE INTO follow(src,dst) VALUES(?,?)",
-            [(src,d) for d in dsts])
-        self.db.commit()
+            [(src,d) for d in dsts]); self.db.commit()
 
 
 # ========= Bluesky API =========
 class BlueskyAPI:
-    """匿名でも動くが、AppPassword があれば Bearer 認証付き"""
     def __init__(self, sess:aiohttp.ClientSession):
         self.sess = sess
         self._did_cache: Dict[str,str] = {}
+
         if BSKY_IDENTIFIER and BSKY_APP_PASSWORD:
             cl = BskyClient(); cl.login(BSKY_IDENTIFIER, BSKY_APP_PASSWORD)
-            self.jwt = cl.access_jwt
+            # バージョン互換
+            self.jwt = getattr(cl, "access_jwt", None) or getattr(cl.current_session, "accessJwt")
             logging.info(f"logged-in as {BSKY_IDENTIFIER}")
         else:
             self.jwt = None
-            logging.warning("AppPassword 未設定: Like が 0 件のアカウントも増えます")
+            logging.warning("AppPassword 未設定: Like は取得できません")
 
     async def _get(self, ep:str, **params)->Dict[str,Any]:
         url=f"{BASE_ENDPOINT}/{ep}"
-        headers = {"Authorization": f"Bearer {self.jwt}"} if self.jwt else None
+        headers = {"Accept": "application/json"}
+        if self.jwt: headers["Authorization"] = f"Bearer {self.jwt}"
         while True:
             r=await self.sess.get(url, params=params, headers=headers, timeout=30)
             if r.status in (502,503,504): await asyncio.sleep(5); continue
@@ -114,7 +108,8 @@ class BlueskyAPI:
     async def _did(self, handle:str)->str:
         if handle in self._did_cache: return self._did_cache[handle]
         js=await self._get("app.bsky.actor.getProfile", actor=handle)
-        self._did_cache[handle]=js["did"]; return js["did"]
+        did=js["did"].strip()           # 改行保険
+        self._did_cache[handle]=did; return did
 
     async def posts(self, actor:str, limit:int=MAX_POSTS_ACC):
         js=await self._get("app.bsky.feed.getAuthorFeed",
@@ -132,14 +127,12 @@ class BlueskyAPI:
         return [u["handle"] for u in js.get("follows", [])]
 
     async def like_uris(self, actor:str, limit:int=MAX_POSTS_ACC)->List[str]:
+        if not self.jwt:      # 未ログイン時は Like 取得不可
+            return []
         did=await self._did(actor)
-        try:
-            js=await self._get("com.atproto.repo.listRecords",
-                               repo=did, collection="app.bsky.feed.like",
-                               limit=min(limit,100))
-        except ClientResponseError as e:
-            if e.status==404: return []
-            raise
+        js=await self._get("com.atproto.repo.listRecords",
+                           repo=did, collection="app.bsky.feed.like",
+                           limit=min(limit,100))
         return [rec["value"]["subject"]["uri"] for rec in js.get("records", [])]
 
     async def posts_by_uri(self, uris:List[str])->Dict[str,str]:
